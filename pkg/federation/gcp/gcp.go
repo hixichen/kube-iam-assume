@@ -336,10 +336,14 @@ func (g *gcpProvider) createWorkloadIdentityPoolProvider(ctx context.Context, pa
 		DisplayName: "KubeAssume OIDC Provider",
 		Description: "OIDC Provider for Kubernetes OIDC federation managed by KubeAssume",
 		AttributeMapping: map[string]string{
-			"google.subject":            "assertion.sub",
-			"attribute.actor":           "assertion.sub",
-			"attribute.aud":             "assertion.aud",
-			"attribute.original_claims": "assertion",
+			"google.subject":                 "assertion.sub",
+			"attribute.actor":                "assertion.sub",
+			"attribute.aud":                  "assertion.aud",
+			"attribute.namespace":            "assertion['kubernetes.io']['namespace']",
+			"attribute.pod_name":             "assertion['kubernetes.io']['pod']['name']",
+			"attribute.pod_uid":              "assertion['kubernetes.io']['pod']['uid']",
+			"attribute.service_account_name": "assertion['kubernetes.io']['serviceaccount']['name']",
+			"attribute.original_claims":      "assertion",
 		},
 		Oidc: &OidcConfig{
 			IssuerURI:        cfg.IssuerURL,
