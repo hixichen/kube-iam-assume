@@ -74,7 +74,7 @@ If you run **EKS, GKE, or AKS**, you don't need this. Your managed service alrea
 
 **Automatic key rotation.** When your API server rotates its signing keys, kube-iam-assume detects the change and publishes both old and new keys simultaneously for 24 hours. Zero-downtime, no manual intervention, no 3am pages.
 
-**Multi-cluster, one IAM policy.** Opt-in multi-cluster mode lets all clusters in a group share one issuer URL and one JWKS endpoint. One IAM trust policy covers every cluster. Add a new cluster to the group — no cloud-side changes needed.
+**Fleet mode, one IAM policy.** Opt-in fleet mode lets a group of clusters share one issuer URL and one aggregated JWKS endpoint. One IAM trust policy covers every cluster in the fleet. Add a new cluster to the fleet — no cloud-side changes needed.
 
 **Five-minute installation.** One `--service-account-issuer` flag on the API server, one `helm install`, one CLI call to register the OIDC provider. That's the full installation.
 
@@ -215,7 +215,7 @@ A single kube-iam-assume installation supports AWS, GCP, Azure, and any other OI
 
 | Version | What Ships |
 |---|---|
-| **v0.1** | S3 publishing, key rotation, multi-cluster shared issuer, AWS CLI setup, Helm chart |
+| **v0.1** | S3 publishing, key rotation, fleet mode, AWS CLI setup, Helm chart |
 | **v0.2** | GCS + Azure Blob, GCP + Azure + Vault CLI setup, Terraform modules, Prometheus metrics |
 | **v0.3** | `CloudIdentityBinding` CRD, mutating webhook for automatic credential injection |
 | **v1.0** | Built-in HTTPS endpoint, CNCF Landscape submission |
@@ -224,7 +224,7 @@ A single kube-iam-assume installation supports AWS, GCP, Azure, and any other OI
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — internal design, token exchange flow, key rotation, multi-cluster, security model, configuration reference
+- [ARCHITECTURE.md](ARCHITECTURE.md) — internal design, token exchange flow, key rotation, fleet mode, Vault integration, security model, configuration reference
 
 ---
 

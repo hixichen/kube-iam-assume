@@ -10,7 +10,7 @@ This document covers the internal design, operational details, and configuration
 - [Token Exchange Flow](#token-exchange-flow)
 - [Internal Design](#internal-design)
 - [Key Rotation](#key-rotation)
-- [Multi-Cluster Shared Issuer](#multi-cluster-shared-issuer)
+- [Fleet Mode](#fleet-mode)
 - [Vault Integration](#vault-integration)
 - [Publishing Modes](#publishing-modes)
 - [Issuer Configuration](#issuer-configuration)
@@ -155,32 +155,34 @@ The controller emits Kubernetes Events on every rotation and exposes Prometheus 
 
 ---
 
-## Multi-Cluster Shared Issuer
+## Fleet Mode
 
-> **Default behaviour is unchanged.** Each cluster gets its own issuer URL. This section describes an opt-in feature for environments that run multiple clusters and want workloads to move across them without YAML changes.
+> **Default behaviour is unchanged.** Each cluster gets its own issuer URL. Fleet mode is opt-in for environments that run multiple clusters and want workloads to move across them without YAML changes.
+
+A **fleet** is a named group of Kubernetes clusters that share one OIDC issuer URL, one aggregated JWKS endpoint, and therefore one set of IAM trust policies — across cloud providers and external Vault alike.
 
 ### The Problem It Solves
 
 In single-cluster mode the OIDC issuer URL is tied to that cluster's bucket. If a workload moves to a different cluster (blue/green, region failover, scale-out), the new cluster has a different issuer URL and the same IAM trust policy no longer matches.
 
-The multi-cluster shared issuer feature solves this: all clusters in the same group share one issuer URL, one JWKS endpoint, and therefore one set of IAM trust policies.
+Fleet mode solves this: every cluster in the fleet shares the same issuer URL and the same aggregated JWKS. One IAM trust policy covers all of them.
 
 ### Why It Works
 
 Every Kubernetes cluster generates its own RSA/ECDSA key pair. Each key has a unique `kid` (derived from the SHA-256 hash of the public key). No two clusters share the same `kid`.
 
-When any cluster in the group presents a token to AWS STS:
+When any cluster in the fleet presents a token to AWS STS:
 
-1. Token `iss` = shared group issuer URL → matches the IAM trust policy
+1. Token `iss` = shared fleet issuer URL → matches the IAM trust policy
 2. Token `kid` identifies which cluster signed it → AWS fetches the aggregated JWKS and finds the right key
 3. Token `sub` = `system:serviceaccount:<namespace>:<name>` → identical for the same SA across all clusters
 
-Same YAML, same IAM role annotation, works on every cluster in the group.
+Same YAML, same IAM role annotation, works on every cluster in the fleet.
 
 ### Configuration
 
 ```yaml
-# Single-cluster mode (default, no changes needed)
+# Single-cluster mode (default)
 controller:
   syncPeriod: 60s
 
@@ -193,23 +195,23 @@ publisher:
 ```
 
 ```yaml
-# Multi-cluster mode — Cluster A
+# Fleet mode — Cluster A
 controller:
-  clusterGroup: prod           # groups clusters sharing one issuer URL
-  clusterID: prod-us-west-2   # unique name within the group
+  fleet: prod              # fleet name; becomes the shared issuer URL prefix
+  clusterID: prod-us-west-2   # unique ID for this cluster within the fleet
 
 publisher:
   type: s3
   s3:
-    bucket: my-company-oidc   # shared bucket for the whole group
+    bucket: my-company-oidc   # shared bucket for the whole fleet
     region: us-west-2
 # Issuer URL: https://my-company-oidc.s3.us-west-2.amazonaws.com/prod
 ```
 
 ```yaml
-# Multi-cluster mode — Cluster B (same group, different ID)
+# Fleet mode — Cluster B (same fleet, different ID)
 controller:
-  clusterGroup: prod
+  fleet: prod
   clusterID: prod-eu-west-1
 
 publisher:
@@ -220,45 +222,59 @@ publisher:
 # Issuer URL: https://my-company-oidc.s3.us-west-2.amazonaws.com/prod  (identical)
 ```
 
+```yaml
+# Staging fleet — isolated from prod, different issuer URL
+controller:
+  fleet: staging
+  clusterID: staging-us-east-1
+
+publisher:
+  type: s3
+  s3:
+    bucket: my-company-oidc   # same bucket is fine — isolated by fleet prefix
+    region: us-west-2
+# Issuer URL: https://my-company-oidc.s3.us-west-2.amazonaws.com/staging
+```
+
 ### Storage Layout
 
 ```
 s3://my-company-oidc/
-  prod/                                      ← clusterGroup = "prod"
-    .well-known/openid-configuration         ← issuer = .../prod (all clusters identical)
+  prod/                                      ← fleet = "prod"
+    .well-known/openid-configuration         ← issuer = .../prod (identical for all clusters)
     openid/v1/jwks                           ← aggregated: union of all prod cluster keys
     clusters/
-      prod-us-west-2/openid/v1/jwks          ← written by cluster A only
-      prod-eu-west-1/openid/v1/jwks          ← written by cluster B only
-  staging/                                   ← clusterGroup = "staging", fully isolated
+      prod-us-west-2/openid/v1/jwks          ← written by prod-us-west-2 only
+      prod-eu-west-1/openid/v1/jwks          ← written by prod-eu-west-1 only
+  staging/                                   ← fleet = "staging", fully isolated
     .well-known/openid-configuration
     openid/v1/jwks
     clusters/
       staging-us-east-1/openid/v1/jwks
 ```
 
-Each cluster writes only to its own sub-path. The aggregated root JWKS is written by the elected leader across all clusters in the group on a configurable interval (default: 5 minutes).
+Each cluster writes only to its own sub-path (`clusters/<clusterID>/openid/v1/jwks`). The aggregated root JWKS (`openid/v1/jwks`) is maintained by the elected leader across all clusters in the fleet on a configurable interval (default: 5 minutes).
 
-### Multi-Cluster Configuration Reference
+### Fleet Configuration Reference
 
 | Field | Default | Description |
 |---|---|---|
-| `controller.clusterGroup` | `""` | Group name; empty disables multi-cluster mode |
-| `controller.clusterID` | `""` | Unique cluster ID within the group; required when `clusterGroup` is set |
+| `controller.fleet` | `""` | Fleet name; empty disables fleet mode |
+| `controller.clusterID` | `""` | Unique cluster ID within the fleet; required when `fleet` is set |
 | `controller.aggregationInterval` | `"5m"` | How often the leader aggregates all cluster JWKS |
 | `controller.clusterTTL` | `"48h"` | Exclude clusters from aggregation after this idle duration |
 
-`clusterGroup` and `clusterID` must match `^[a-z0-9][a-z0-9-]*[a-z0-9]$`.
+`fleet` and `clusterID` must match `^[a-z0-9][a-z0-9-]*[a-z0-9]$`.
 
 ### Cluster Decommissioning
 
-When a cluster is permanently removed, its per-cluster JWKS sub-path becomes stale. The `clusterTTL` (default: 48 hours) controls how long the leader waits before dropping a cluster from aggregation if it has not published an update. To decommission immediately, delete the `clusters/<clusterID>/` sub-path in the bucket.
+When a cluster is permanently removed from the fleet, its per-cluster JWKS sub-path becomes stale. The `clusterTTL` (default: 48 hours) controls how long the leader waits before dropping a cluster from aggregation if it has not published an update. To decommission immediately, delete the `clusters/<clusterID>/` sub-path in the bucket.
 
 ---
 
 ## Vault Integration
 
-The target scenario for this section is **external Vault**: HCP Vault, Vault deployed on a cloud VM, or a centralised Vault cluster serving multiple Kubernetes clusters. External Vault has no network path to your cluster's API server and therefore cannot use the Kubernetes auth method's TokenReview mechanism. It can only validate tokens by fetching a publicly reachable JWKS — which is exactly what kube-iam-assume publishes.
+The target scenario is **external Vault**: HCP Vault, Vault deployed on a cloud VM, or a centralised Vault cluster serving multiple Kubernetes clusters. External Vault has no network path to your cluster's API server and therefore cannot use the Kubernetes auth method's TokenReview mechanism. It validates tokens by fetching a publicly reachable JWKS — which is exactly what kube-iam-assume publishes.
 
 If Vault is running inside the same cluster and can reach the API server directly, you would use the Kubernetes auth method (`auth/kubernetes`) and kube-iam-assume is not involved.
 
@@ -266,7 +282,7 @@ If Vault is running inside the same cluster and can reach the API server directl
 
 External Vault uses the JWT auth method (`auth/jwt`). The validation flow is the same as cloud IAM federation:
 
-1. Pod presents a projected SA token to Vault (over the network, e.g. via Vault Agent).
+1. Pod presents a projected SA token to Vault (over the network, via Vault Agent).
 2. Vault extracts the `iss` claim.
 3. Vault fetches `<issuer>/.well-known/openid-configuration` from the kube-iam-assume bucket.
 4. Vault fetches the JWKS and validates the token signature.
@@ -275,6 +291,56 @@ External Vault uses the JWT auth method (`auth/jwt`). The validation flow is the
 
 Vault never contacts your Kubernetes API server. It only reads from the public bucket.
 
+### The Issuer Field — A Critical Constraint
+
+When you configure `oidc_discovery_url` in Vault, Vault:
+
+1. Fetches `<oidc_discovery_url>/.well-known/openid-configuration`
+2. Reads the `issuer` field from the returned document
+3. **Validates that `issuer` exactly equals `oidc_discovery_url`** (RFC 8414 compliance)
+4. Rejects the configuration if there is any mismatch
+
+The `issuer` field in the discovery document is set by the Kubernetes API server via `--service-account-issuer`. kube-iam-assume republishes this document verbatim — it does not modify the `issuer` field.
+
+**The three values must form an exact triangle:**
+
+```
+--service-account-issuer  ==  kube-iam-assume public URL  ==  Vault oidc_discovery_url
+```
+
+If any of these differ — including a trailing slash on one but not another — Vault will reject the configuration with:
+
+```
+error writing auth/jwt/config: ... issuer did not match the expected issuer
+```
+
+**Common mistakes:**
+
+| Mistake | Effect |
+|---|---|
+| `oidc_discovery_url` has a trailing slash, issuer does not | Vault rejects config write |
+| `oidc_discovery_url` uses `http://`, issuer uses `https://` | Vault rejects config write |
+| API server issuer does not match the bucket URL | Tokens fail validation at runtime |
+| Fleet mode: using bucket root instead of `bucket/fleet-name` | `issuer` in discovery doc won't match |
+
+**Verify before configuring Vault:**
+
+```bash
+# Fetch and inspect the discovery document kube-iam-assume published
+curl -s https://my-cluster-oidc.s3.us-west-2.amazonaws.com/.well-known/openid-configuration \
+  | jq '.issuer'
+# Should output: "https://my-cluster-oidc.s3.us-west-2.amazonaws.com"
+# Use this exact string as oidc_discovery_url in Vault
+```
+
+For fleet mode:
+
+```bash
+curl -s https://my-company-oidc.s3.us-west-2.amazonaws.com/prod/.well-known/openid-configuration \
+  | jq '.issuer'
+# Should output: "https://my-company-oidc.s3.us-west-2.amazonaws.com/prod"
+```
+
 ### Configuration
 
 #### Step 1: Configure the JWT auth method (on Vault)
@@ -282,13 +348,14 @@ Vault never contacts your Kubernetes API server. It only reads from the public b
 ```bash
 vault auth enable jwt
 
+# Use the exact issuer value from the discovery document above
 vault write auth/jwt/config \
   oidc_discovery_url="https://my-cluster-oidc.s3.us-west-2.amazonaws.com"
 ```
 
-Vault fetches `/.well-known/openid-configuration` and extracts the `jwks_uri` automatically. No manual JWKS URL configuration needed.
+Vault fetches `/.well-known/openid-configuration`, validates the issuer, and extracts `jwks_uri` automatically. No manual JWKS URL configuration is needed.
 
-For HCP Vault, do this via the HCP Vault UI or the Vault CLI pointed at your HCP cluster address.
+For HCP Vault, set `VAULT_ADDR` to your HCP cluster address and use the same commands.
 
 #### Step 2: Create a role
 
@@ -343,6 +410,12 @@ sink "file" {
 }
 ```
 
+### JWKS Caching and Key Rotation
+
+Vault caches the JWKS it fetches from `jwks_uri`. The default cache duration is configurable but typically 1 hour. During a signing key rotation, Vault may use the stale cached JWKS for up to the cache duration and reject tokens signed with the new key.
+
+kube-iam-assume's 24-hour dual-publish overlap covers this: during a rotation, both the old and new keys remain in the published JWKS for 24 hours. Vault's cached JWKS still contains the old key, so old tokens validate. Once Vault refreshes its cache, it picks up both keys and both old and new tokens validate. No downtime, no intervention required.
+
 ### Multi-Audience Workloads (Cloud IAM + Vault simultaneously)
 
 A workload that needs both AWS credentials and Vault access requires two projected token volumes — one per audience. A single token cannot serve both: cloud STS rejects tokens whose `aud` is not `sts.amazonaws.com`, and Vault rejects tokens with `sts.amazonaws.com` in `bound_audiences`.
@@ -383,7 +456,7 @@ Both tokens are issued by the same API server and validated against the same kub
 
 ### Fine-Grained Access with `bound_claims`
 
-Vault's JWT auth can condition on any claim in the token. Kubernetes 1.21+ tokens include namespace and pod identity under the `kubernetes.io` key, which Vault can use for tighter role binding:
+Vault's JWT auth can condition on any claim in the token. Kubernetes 1.21+ tokens include namespace and pod identity under the `kubernetes.io` key:
 
 ```bash
 vault write auth/jwt/role/my-app \
@@ -399,20 +472,20 @@ vault write auth/jwt/role/my-app \
 
 `bound_claims` on pod-level fields (`kubernetes.io/pod/name`) is possible but creates ephemeral roles tied to a specific pod name. Only use this for high-privilege workloads where the operational overhead is justified.
 
-### Multi-Cluster Vault Setup
+### Fleet Mode with Vault
 
-With kube-iam-assume's multi-cluster shared issuer mode, one Vault JWT auth configuration covers every cluster in the group. Configure Vault once with the shared issuer URL:
+With fleet mode, one Vault JWT auth configuration covers every cluster in the fleet. Configure Vault once with the fleet issuer URL:
 
 ```bash
 vault write auth/jwt/config \
   oidc_discovery_url="https://my-company-oidc.s3.us-west-2.amazonaws.com/prod"
 ```
 
-All clusters in the `prod` group share this issuer. Their keys are aggregated into the same JWKS. Adding a new cluster to the group requires no Vault-side changes.
+All clusters in the `prod` fleet share this issuer. Their keys are aggregated into the same JWKS. Adding a new cluster to the fleet requires no Vault-side changes — the new cluster's key appears in the aggregated JWKS automatically within one aggregation interval.
 
 ### Issuer Migration for Existing Vault Setups
 
-If you previously configured Vault with the old in-cluster issuer (`https://kubernetes.default.svc.cluster.local`) — for example via Vault's Kubernetes auth method configured to accept projected tokens — and are now migrating to kube-iam-assume, update the JWT auth config after deploying kube-iam-assume:
+If Vault was previously configured with the old in-cluster issuer and you are migrating to kube-iam-assume, update the JWT auth config after deploying kube-iam-assume:
 
 ```bash
 vault write auth/jwt/config \
@@ -434,7 +507,7 @@ kube-iam-assume setup vault \
   --role my-app
 ```
 
-This enables the JWT auth method, writes the config, and creates the role in one command.
+This enables the JWT auth method, writes the config, and creates the role in one command. It also validates that the `issuer` in the published discovery document matches `--issuer-url` before writing the Vault config, catching the issuer mismatch problem before it reaches Vault.
 
 ---
 
@@ -469,7 +542,7 @@ Changing `--service-account-issuer` is the only cluster-level change kube-iam-as
 
 ### What This Flag Does
 
-It sets the `iss` (issuer) claim in all newly issued projected service account tokens. Cloud providers use this claim to locate the OIDC discovery document and fetch the JWKS.
+It sets the `iss` (issuer) claim in all newly issued projected service account tokens. Cloud providers and external Vault use this claim to locate the OIDC discovery document and fetch the JWKS.
 
 ### What It Does NOT Affect
 
@@ -481,7 +554,7 @@ It sets the `iss` (issuer) claim in all newly issued projected service account t
 
 Any external system that validates projected SA tokens by checking the `iss` claim:
 
-- HashiCorp Vault JWT/OIDC auth configured with the old issuer URL
+- HashiCorp Vault JWT auth configured with the old issuer URL
 - Istio if configured with a specific issuer expectation
 - Custom admission webhooks that validate SA token issuers
 - Other federation targets already using the old issuer
@@ -625,6 +698,7 @@ Kubernetes 1.21+ tokens carry pod-level claims under the `kubernetes.io` key:
 | AWS | No — trust policy conditions only support `sub` and `aud` |
 | GCP | Yes — attribute mapping (CEL) can expose pod claims as custom attributes |
 | Azure | No — federated credential conditions are limited to `sub` |
+| Vault | Yes — `bound_claims` can match any `kubernetes.io` field |
 
 On GCP, kube-iam-assume configures attribute mappings for `pod_name`, `pod_uid`, `namespace`, and `service_account_name` automatically.
 
@@ -654,6 +728,7 @@ If the API server's signing key is compromised, an attacker can forge tokens for
 
 - OIDC bridge controller with S3 publishing
 - Automatic JWKS rotation with dual-publish overlap
+- Fleet mode for multi-cluster shared issuer
 - `generate-bucket-name` CLI with tagging and multiple output formats
 - `get-bucket-info` reverse-lookup CLI
 - `setup aws` CLI for OIDC IdP registration
@@ -663,7 +738,7 @@ If the API server's signing key is compromised, an attacker can forge tokens for
 ### v0.2 — Multi-Cloud
 
 - GCS and Azure Blob publishing modes
-- `setup gcp` and `setup azure` CLI commands
+- `setup gcp`, `setup azure`, and `setup vault` CLI commands
 - Terraform modules for cloud-side OIDC IdP registration
 - Prometheus metrics
 
@@ -691,7 +766,7 @@ Cloud providers cache the JWKS. If the controller stops publishing, existing cac
 
 **Does kube-iam-assume replace SPIRE?**
 
-No. See [README.md — kube-iam-assume vs SPFFE/SPIRE](README.md#kube-iam-assume-vs-spiffespire) for a full comparison.
+No. See [README.md — kube-iam-assume vs SPIFFE/SPIRE](README.md#kube-iam-assume-vs-spiffespire) for a full comparison.
 
 **Can I use kube-iam-assume with EKS/GKE/AKS?**
 
@@ -715,4 +790,4 @@ kube-iam-assume automates what you would otherwise do with a script and adds: au
 
 **How do I differentiate two pods that share the same service account?**
 
-You can't — by design. The `sub` claim is bound to the SA, not the pod. Use one SA per workload identity. On GCP, kube-iam-assume maps `kubernetes.io` pod claims as custom attributes, enabling conditions targeting specific pods. For workload-level identity, use SPIFFE/SPIRE.
+You can't — by design. The `sub` claim is bound to the SA, not the pod. Use one SA per workload identity. On GCP, kube-iam-assume maps `kubernetes.io` pod claims as custom attributes, enabling conditions targeting specific pods. On Vault, use `bound_claims` on `kubernetes.io` fields. For workload-level identity, use SPIFFE/SPIRE.
